@@ -4,6 +4,7 @@ import bisect
 import itertools
 import json
 import math
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -28,20 +29,32 @@ class UpstreamError(Exception):
     pass
 
 
-def _fetch(url, body=None):
+def _fetch(url, body=None, attempts=5):
+    """JSON from `url` (POSTing `body` if given). Public servers blip, so 5xx and dropped connections are retried."""
     data = json.dumps(body).encode() if body is not None else None
-    try:
-        with urllib.request.urlopen(urllib.request.Request(url, data, HEADERS), timeout=30) as r:
-            return json.load(r)
-    except urllib.error.HTTPError as e:
+    host = urllib.parse.urlsplit(url).hostname
+    for attempt in range(1, attempts + 1):
         try:
-            body = json.load(e)
-            msg = body.get("reason") or body.get("error")  # Open-Meteo / Valhalla error shapes
-        except ValueError:
-            msg = None
-        raise UpstreamError(msg if isinstance(msg, str) else str(e)) from e
-    except (urllib.error.URLError, TimeoutError) as e:
-        raise UpstreamError(str(e)) from e
+            # Overloaded Open-Meteo answers 50-point batches in ~25 s; slow beats failing.
+            with urllib.request.urlopen(urllib.request.Request(url, data, HEADERS), timeout=60) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            if e.code >= 500 and attempt < attempts:
+                time.sleep(attempt)
+                continue
+            try:
+                err = json.load(e)
+                msg = err.get("reason") or err.get("error")  # Open-Meteo / Valhalla error shapes
+            except ValueError:
+                msg = None
+            raise UpstreamError(f"{host}: {msg if isinstance(msg, str) else e}") from e
+        except (urllib.error.URLError, TimeoutError) as e:
+            reason = getattr(e, "reason", e)  # timeouts during the TLS handshake arrive wrapped in URLError
+            # A server too slow to answer in 60 s won't be faster on a retry; dropped connections might be.
+            if not isinstance(reason, TimeoutError) and attempt < attempts:
+                time.sleep(attempt)
+                continue
+            raise UpstreamError(f"{host}: {reason}") from e
 
 
 def geocode(query, limit=5):
@@ -206,11 +219,11 @@ def _forecast(points, start, hours):
                 (h["wind_speed_10m"][i] or 0, (h["rain"][i] or 0) + (h["showers"][i] or 0), h["snowfall"][i] or 0)
                 for i in range(len(h["time"]))
             ]
+        cache.set_many(out, 1800)  # cached per batch, so if another batch fails a retry only refetches that one
         return out
 
-    with ThreadPoolExecutor(4) as pool:
-        for got in pool.map(fetch, [missing[i : i + 100] for i in range(0, len(missing), 100)]):
-            cache.set_many(got, 1800)
+    with ThreadPoolExecutor(8) as pool:
+        for got in pool.map(fetch, [missing[i : i + 50] for i in range(0, len(missing), 50)]):
             found.update(got)
     return [found[k] for k in keys]
 

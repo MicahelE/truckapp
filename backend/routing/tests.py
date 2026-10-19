@@ -1,7 +1,11 @@
+import io
+import urllib.error
+from unittest import mock
+
 from django.test import SimpleTestCase
 
 from .risk import HIGH, LOW, MODERATE, NO_TRAVEL, SEVERE, classify, recommend, score, summarize
-from .services import decode_polyline6
+from .services import UpstreamError, _fetch, decode_polyline6
 
 
 class RiskRules(SimpleTestCase):
@@ -54,3 +58,40 @@ class Polyline(SimpleTestCase):
     def test_decode(self):
         # Google's reference polyline; at precision 6 the coordinates come out 10x smaller.
         self.assertEqual(decode_polyline6("_p~iF~ps|U_ulLnnqC_mqNvxq`@"), [(3.85, -12.02), (4.07, -12.095), (4.3252, -12.6453)])
+
+
+class Fetch(SimpleTestCase):
+    def setUp(self):
+        patcher = mock.patch("time.sleep")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_retries_server_errors_and_dropped_connections(self):
+        ok = mock.MagicMock()
+        ok.__enter__.return_value = io.BytesIO(b'{"ok": 1}')
+        unavailable = urllib.error.HTTPError("u", 503, "Unavailable", {}, io.BytesIO(b""))
+        reset = urllib.error.URLError(ConnectionResetError("reset"))
+        with mock.patch("urllib.request.urlopen", side_effect=[unavailable, reset, ok]):
+            self.assertEqual(_fetch("https://x.test/"), {"ok": 1})
+
+    def test_timeouts_fail_fast_naming_the_host(self):
+        slow = TimeoutError("The read operation timed out")
+        for error in (slow, urllib.error.URLError(slow)):  # read timeout, TLS handshake timeout
+            with mock.patch("urllib.request.urlopen", side_effect=error) as urlopen:
+                with self.assertRaisesRegex(UpstreamError, "^x.test: The read operation timed out$"):
+                    _fetch("https://x.test/")
+            self.assertEqual(urlopen.call_count, 1)
+
+    def test_gives_up_after_repeated_server_errors(self):
+        unavailable = urllib.error.HTTPError("u", 503, "Unavailable", {}, io.BytesIO(b""))
+        with mock.patch("urllib.request.urlopen", side_effect=unavailable) as urlopen:
+            with self.assertRaisesRegex(UpstreamError, "^x.test: HTTP Error 503"):
+                _fetch("https://x.test/")
+        self.assertEqual(urlopen.call_count, 5)
+
+    def test_client_errors_are_not_retried(self):
+        rate_limited = urllib.error.HTTPError("u", 429, "Too Many", {}, io.BytesIO(b'{"error": true, "reason": "Slow down"}'))
+        with mock.patch("urllib.request.urlopen", side_effect=rate_limited) as urlopen:
+            with self.assertRaisesRegex(UpstreamError, "^x.test: Slow down$"):
+                _fetch("https://x.test/")
+        self.assertEqual(urlopen.call_count, 1)

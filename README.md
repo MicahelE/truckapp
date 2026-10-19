@@ -81,5 +81,7 @@ included). The colors therefore line up with the checkpoint dots. Slider hour 0 
 * Sustained wind is classified, not gusts.
 * The free Open-Meteo tier allows 600 locations/min. One trip uses roughly 150 grid points plus its checkpoints, so rapid repeat
   queries for *new* trips can hit 429 (shown as a readable error). Repeats hit the cache. A paid key lifts this.
-* The public Valhalla and Photon servers are best-effort demo instances.
+* The public Valhalla and Photon servers and free Open-Meteo are best-effort. Calls retry 5xx errors and dropped
+  connections up to 5 times and allow 60 s per request. A request that times out fails the trip. Batches that
+  succeeded stay cached, so a retry only refetches what failed.
 * Departures are limited to the next 7 days, which keeps the whole trip inside the forecast window.
