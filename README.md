@@ -1,0 +1,85 @@
+# Weather-Aware Truck Routing
+
+React + Django app that compares three truck routes between two places, forecasts the weather each
+checkpoint will see **when the truck gets there**, classifies risk with the load-aware rules from the
+brief, and recommends the safest route.
+
+**Live:** _add hosted URL_ · **Walkthrough:** _add Loom URL_
+
+## Run locally
+
+```bash
+# API (Python 3.12+)
+cd backend
+python -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python manage.py runserver          # http://127.0.0.1:8000
+
+# UI (Node 22+), in another terminal
+cd frontend
+npm install && npm run dev                    # http://localhost:5173, proxies /api to Django
+```
+
+Tests (risk thresholds, load rules, mile attribution, ranking, polyline decoding):
+
+```bash
+cd backend && .venv/bin/python manage.py test routing
+```
+
+No API keys are needed. Every upstream is a free public service.
+
+## Deploy
+
+`Dockerfile` builds the React app and serves it and the API from one gunicorn process (WhiteNoise
+serves the static files, so there's no CORS and a single URL). On Render, Railway or Fly, point a
+Docker web service at the repo. It listens on `$PORT`. Optional env: `SECRET_KEY`, `ALLOWED_HOSTS`.
+
+## How it works
+
+```
+React (Vite, MapLibre GL) ── POST /api/routes ──▶ Django
+                                                   ├─ Valhalla (truck costing, load weight) → up to 3 routes
+                                                   ├─ sample checkpoints every 10/25/50 mi with ETAs
+                                                   ├─ Open-Meteo hourly forecast (checkpoints + corridor grid)
+                                                   └─ risk.py: classify → summarize → recommend
+```
+
+| Piece | Where | Notes |
+|---|---|---|
+| Geocoding | Photon (`/api/geocode`) | Autocomplete via native `<datalist>`. Free text is also accepted and geocoded server-side. |
+| Routing | Valhalla public server, `truck` costing | Gross weight = 35,000 lb rig + load, so weight-restricted roads are avoided. Travel times are Valhalla's truck speeds. |
+| 3 options | `services.find_routes` | Valhalla alternates first. If fewer than 3 come back, a via point is offset perpendicular to the trip at ±15% and ±30% of its length (snapped to primary roads). Candidates that overlap an existing route by 80% or more are dropped. When the road network has fewer distinct routes (e.g. the Outer Banks), the UI says so. |
+| ETAs | `services._profile` | Each Valhalla maneuver's drive time is spread over its shape points by distance. A checkpoint's ETA is departure plus the interpolated time at its mile. |
+| Weather | Open-Meteo hourly `wind_speed_10m` (mph), `rain + showers` and `snowfall` (in/hr) | Uses the forecast hour nearest each checkpoint's ETA. Cached for 30 min per location. |
+| Risk | `routing/risk.py` (pure, unit-tested) | See below. |
+| Heatmap | `services._corridor_grid` | Lattice points within 30 mi of any route (≤150 points), each with 49 hourly risk scores. The slider only changes which hour's score drives the MapLibre heatmap layer's weight, so moving it doesn't refetch anything from the server. |
+
+### Risk rules
+
+* Ranges are lower-inclusive: 25 mph is Moderate, 0.25 in/hr rain is High. Rain/snow No Travel is strictly
+  greater than 1.00 / 3.0, as written in the brief.
+* Load rules: wind ≥55 mph is No Travel; 45–54 mph with >30,000 lb is No Travel; 35–44 mph with >40,000 lb is Severe.
+* A checkpoint's level is the worst of wind (after load rules), rain and snow.
+* Each mile of a route is attributed to its **nearest checkpoint**, which gives miles per level and a
+  mile-weighted average level (0 = Low … 4 = No Travel).
+
+### Recommendation
+
+Lexicographic, in the brief's order: fewest **No Travel** miles (not in the brief, but strictly worse
+than Severe), then fewest Severe miles, fewest High miles, lowest average risk, shortest travel time. Miles
+are compared to 0.1 mi, average risk to 0.01 and time to 0.1 h. The card shows the first criterion that
+separated the winner from the runner-up.
+
+### Heatmap score
+
+Continuous 0–4: each condition is linearly interpolated between its thresholds (30 mph → 1.5), the
+max is taken, then clamped into the checkpoint's level band so `floor(score) == level` (load rules
+included). The colors therefore line up with the checkpoint dots. Slider hour 0 is the departure hour.
+
+## Known limits
+
+* No Hours-of-Service breaks: ETAs assume continuous driving. Adding 30-min / 10-h rests is a function from drive time to clock time inside `plan_trip`.
+* Sustained wind is classified, not gusts.
+* The free Open-Meteo tier allows 600 locations/min. One trip uses roughly 150 grid points plus its checkpoints, so rapid repeat
+  queries for *new* trips can hit 429 (shown as a readable error). Repeats hit the cache. A paid key lifts this.
+* The public Valhalla and Photon servers are best-effort demo instances.
+* Departures are limited to the next 7 days, which keeps the whole trip inside the forecast window.
