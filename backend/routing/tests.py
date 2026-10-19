@@ -8,7 +8,7 @@ from django.core.cache import cache
 from django.test import SimpleTestCase
 
 from .risk import HIGH, LOW, MODERATE, NO_TRAVEL, SEVERE, classify, recommend, score, summarize
-from .services import UpstreamError, _fetch, _forecast, decode_polyline6, met_no_hourly
+from .services import UpstreamError, _fetch, _forecast, _met_no_throttle, decode_polyline6, met_no_hourly
 
 
 class RiskRules(SimpleTestCase):
@@ -154,3 +154,13 @@ class BackupWeather(SimpleTestCase):
         got = lambda msg: {"side_effect": UpstreamError(msg)}
         with self.assertRaisesRegex(UpstreamError, "^api.met.no: timed out; api.open-meteo.com: HTTP Error 503$"):
             self.run_forecast(datetime.now(timezone.utc), got("api.met.no: timed out"), got("api.open-meteo.com: HTTP Error 503"))
+
+
+class Throttle(SimpleTestCase):
+    def test_met_no_calls_are_spaced_at_the_rate_limit(self):
+        sleeps = []
+        with mock.patch("routing.services._met_no_next", 0.0), mock.patch("time.monotonic", return_value=1000.0), \
+                mock.patch("time.sleep", side_effect=sleeps.append):
+            for _ in range(4):
+                _met_no_throttle()
+        self.assertEqual([round(x, 3) for x in sleeps], [0, 0.067, 0.133, 0.2])  # 15/s, even when called at once

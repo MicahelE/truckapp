@@ -28,7 +28,9 @@ HEATMAP_HOURS = 48
 DETOURS = (0.15, -0.15, 0.3, -0.3)  # via-point offsets (share of trip length) when Valhalla returns < 3 routes
 MPH_PER_MS = 2.23694
 SNOW_CM_PER_MM = 0.7  # snow depth per mm of liquid, the ratio Open-Meteo's snowfall uses
-_met_no_slots = threading.Semaphore(10)  # ~0.8 s per call keeps MET Norway near 12 req/s, under its 20/s limit
+MET_NO_PER_SECOND = 15  # MET Norway's terms cap an app at 20 requests/s
+_met_no_lock = threading.Lock()
+_met_no_next = 0.0
 MET_NO_HOURLY = timedelta(hours=60)  # MET Norway is hourly this far ahead, then 6-hourly
 
 
@@ -185,21 +187,27 @@ def _detour(route, origin, dest, offset):
     return {"lat": lat + offset * dx, "lon": lon - offset * dy / kx, "search_filter": {"min_road_class": "primary"}}
 
 
+def _detour_route(base, origin, dest, offset, load_lbs):
+    via = _detour(base, origin, dest, offset)
+    try:
+        return _valhalla([origin, {**via, "type": "through"}, dest], load_lbs)[0]
+    except UpstreamError as e:
+        if "max distance" not in str(e):  # e.g. no road near the via point; splitting won't help
+            return None
+    try:  # the public server caps multi-stop routes at 1500 km; route the legs separately
+        return _join(_valhalla([origin, via], load_lbs)[0], _valhalla([via, dest], load_lbs)[0])
+    except UpstreamError:
+        return None
+
+
 def find_routes(origin, dest, load_lbs):
     routes = _valhalla([origin, dest], load_lbs, alternates=2)
-    for offset in DETOURS:
-        if len(routes) >= 3:
-            break
-        via = _detour(routes[0], origin, dest, offset)
-        try:
-            r = _valhalla([origin, {**via, "type": "through"}, dest], load_lbs)[0]
-        except UpstreamError:  # public server caps multi-stop routes at 1500 km; route the legs separately
-            try:
-                r = _join(_valhalla([origin, via], load_lbs)[0], _valhalla([via, dest], load_lbs)[0])
-            except UpstreamError:
-                continue
-        if all(_overlap(r, other) < 0.8 for other in routes):
-            routes.append(r)
+    if len(routes) < 3:
+        # All detours in parallel (~3 s instead of ~3 s each); kept in DETOURS order so the mildest win.
+        with ThreadPoolExecutor(len(DETOURS)) as pool:
+            for r in pool.map(lambda off: _detour_route(routes[0], origin, dest, off, load_lbs), DETOURS):
+                if r and len(routes) < 3 and all(_overlap(r, other) < 0.8 for other in routes):
+                    routes.append(r)
     return routes[:3]
 
 
@@ -256,15 +264,25 @@ def met_no_hourly(timeseries, start, hours):
     return out
 
 
+def _met_no_throttle():
+    """Space MET Norway requests evenly at MET_NO_PER_SECOND across all threads."""
+    global _met_no_next
+    with _met_no_lock:
+        now = time.monotonic()
+        slot = max(now, _met_no_next)
+        _met_no_next = slot + 1 / MET_NO_PER_SECOND
+    time.sleep(slot - now)
+
+
 def _met_no(points, start, hours):
-    """One request per point; healthy calls take ~0.8 s, so a slow or failing one hands the batch to the backup."""
+    """One request per point; a slow or failing one hands the whole batch to the backup."""
 
     def one(point):
-        with _met_no_slots:
-            data = _fetch(f"{MET_NO}?lat={point[0]:.2f}&lon={point[1]:.2f}", attempts=2, timeout=10)
+        _met_no_throttle()
+        data = _fetch(f"{MET_NO}?lat={point[0]:.2f}&lon={point[1]:.2f}", attempts=2, timeout=10)
         return met_no_hourly(data["properties"]["timeseries"], start, hours)
 
-    pool = ThreadPoolExecutor(10)
+    pool = ThreadPoolExecutor(25)  # uncached points take ~2.7 s, so the rate limit, not the pool, sets the pace
     try:
         return list(pool.map(one, points))
     finally:

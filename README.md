@@ -33,6 +33,14 @@ No API keys are needed. Every upstream is a free public service.
 serves the static files, so there's no CORS and a single URL). On Render, Railway or Fly, point a
 Docker web service at the repo. It listens on `$PORT`. Optional env: `SECRET_KEY`, `ALLOWED_HOSTS`.
 
+## Using the app
+
+* **Timeline:** ▶ plays the 48-hour forecast. A truck marker for each route moves to where that truck will be at that
+  moment; the selected route's truck shows its mile and current risk. Each route's arrival time is marked on the slider.
+* **Checkpoints:** hover or click dots on the map. Clicking a row in a route's checkpoint table flies the map there.
+* **Share:** the URL holds the trip (`?from=&to=&depart=&load=&every=`) and plans it on open. **Copy link** copies it.
+* Follows the system light/dark theme and reduced-motion setting, and works at phone width.
+
 ## How it works
 
 ```
@@ -51,7 +59,7 @@ React (Vite, MapLibre GL) ── POST /api/routes ──▶ Django
 | ETAs | `services._profile` | Each Valhalla maneuver's drive time is spread over its shape points by distance. A checkpoint's ETA is departure plus the interpolated time at its mile. |
 | Weather | MET Norway Locationforecast, with Open-Meteo hourly `wind_speed_10m`, `rain + showers` and `snowfall` | MET Norway goes first when the trip's forecast window ends within 60 h, while it still has hourly data. It answers one point per request (~0.8 s); at most 10 run at once, which keeps under its 20 req/s limit, and a trip takes ~20 s. Further out MET Norway only has 6-hour blocks, which hide short bursts of heavy rain, so Open-Meteo (hourly for 16 days, 50 points per request) goes first. Each backs up the other per 50-point batch. MET Norway's m/s become mph, and its liquid mm become rain, or snow at Open-Meteo's 7:1 ratio, according to the period's weather symbol. The UI shows which service supplied the trip's weather, because the models can disagree. Uses the forecast hour nearest each checkpoint's ETA. Cached for 30 min per location. |
 | Risk | `routing/risk.py` (pure, unit-tested) | See below. |
-| Heatmap | `services._corridor_grid` | Lattice points within 30 mi of any route (≤150 points), each with 49 hourly risk scores. The slider only changes which hour's score drives the MapLibre heatmap layer's weight, so moving it doesn't refetch anything from the server. |
+| Heatmap | `services._corridor_grid` | Lattice points within 30 mi of any route (≤150 points), each with 49 hourly risk scores sent in one response. The timeline only changes the MapLibre heatmap layer's weight expression, blending the two nearest hours in fifths, so playback is smooth (measured ~120 fps, no frames over 34 ms) and never refetches. |
 
 ### Risk rules
 

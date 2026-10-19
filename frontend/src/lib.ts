@@ -42,6 +42,12 @@ export const ROUTE_NAMES = ["A", "B", "C"];
 const timeFmt = new Intl.DateTimeFormat(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" });
 export const fmtTime = (iso: string | number | Date) => timeFmt.format(new Date(iso));
 
+/** Date -> "YYYY-MM-DDTHH:00" in local time, the format <input type="datetime-local"> takes. */
+export function localInput(d: Date) {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 export const fmtDuration = (s: number) => {
   const m = Math.round(s / 60);
   return `${Math.floor(m / 60)}h ${m % 60}m`;
