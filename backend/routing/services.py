@@ -4,12 +4,13 @@ import bisect
 import itertools
 import json
 import math
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from django.core.cache import cache
 
@@ -18,26 +19,38 @@ from . import risk
 PHOTON = "https://photon.komoot.io/api/"
 VALHALLA = "https://valhalla1.openstreetmap.de/route"
 OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
-HEADERS = {"User-Agent": "truckapp-assessment/1.0", "Content-Type": "application/json"}
+MET_NO = "https://api.met.no/weatherapi/locationforecast/2.0/compact"
+# MET Norway's terms require a User-Agent that identifies the app.
+HEADERS = {"User-Agent": "truckapp-assessment/1.0 (+https://github.com/MicahelE/truckapp)", "Content-Type": "application/json"}
 
 EMPTY_RIG_LBS = 35_000  # tractor + empty trailer; Valhalla wants gross weight
 HEATMAP_HOURS = 48
 DETOURS = (0.15, -0.15, 0.3, -0.3)  # via-point offsets (share of trip length) when Valhalla returns < 3 routes
+MPH_PER_MS = 2.23694
+SNOW_CM_PER_MM = 0.7  # snow depth per mm of liquid, the ratio Open-Meteo's snowfall uses
+_met_no_slots = threading.Semaphore(10)  # ~0.8 s per call keeps MET Norway near 12 req/s, under its 20/s limit
+MET_NO_HOURLY = timedelta(hours=60)  # MET Norway is hourly this far ahead, then 6-hourly
 
 
 class UpstreamError(Exception):
     pass
 
 
-def _fetch(url, body=None, attempts=5):
+def _fetch(url, body=None, attempts=5, timeout=60):
     """JSON from `url` (POSTing `body` if given). Public servers blip, so 5xx and dropped connections are retried."""
     data = json.dumps(body).encode() if body is not None else None
     host = urllib.parse.urlsplit(url).hostname
     for attempt in range(1, attempts + 1):
         try:
-            # Overloaded Open-Meteo answers 50-point batches in ~25 s; slow beats failing.
-            with urllib.request.urlopen(urllib.request.Request(url, data, HEADERS), timeout=60) as r:
-                return json.load(r)
+            # The socket timeout only bounds each read; a server trickling bytes needs a deadline on the whole body.
+            deadline = time.monotonic() + timeout
+            with urllib.request.urlopen(urllib.request.Request(url, data, HEADERS), timeout=timeout) as r:
+                raw = b""
+                while chunk := r.read(65536):
+                    if time.monotonic() > deadline:
+                        raise TimeoutError("response too slow")
+                    raw += chunk
+                return json.loads(raw)
         except urllib.error.HTTPError as e:
             if e.code >= 500 and attempt < attempts:
                 time.sleep(attempt)
@@ -50,7 +63,7 @@ def _fetch(url, body=None, attempts=5):
             raise UpstreamError(f"{host}: {msg if isinstance(msg, str) else e}") from e
         except (urllib.error.URLError, TimeoutError) as e:
             reason = getattr(e, "reason", e)  # timeouts during the TLS handshake arrive wrapped in URLError
-            # A server too slow to answer in 60 s won't be faster on a retry; dropped connections might be.
+            # A server too slow to answer won't be faster on a retry; dropped connections might be.
             if not isinstance(reason, TimeoutError) and attempt < attempts:
                 time.sleep(attempt)
                 continue
@@ -193,34 +206,98 @@ def find_routes(origin, dest, load_lbs):
 # --- weather ------------------------------------------------------------------
 
 
+def _open_meteo(points, start, hours):
+    params = {
+        "latitude": ",".join(f"{lat:.2f}" for lat, _ in points),
+        "longitude": ",".join(f"{lon:.2f}" for _, lon in points),
+        "hourly": "wind_speed_10m,rain,showers,snowfall",
+        "wind_speed_unit": "mph",
+        "precipitation_unit": "inch",  # also makes snowfall inches
+        "timezone": "GMT",
+        "start_hour": f"{start:%Y-%m-%dT%H:%M}",
+        "end_hour": f"{start + timedelta(hours=hours):%Y-%m-%dT%H:%M}",
+    }
+    # With a backup ready, give up sooner than the 60 s / 5 tries default.
+    data = _fetch(OPEN_METEO + "?" + urllib.parse.urlencode(params), attempts=3, timeout=30)
+    series = []
+    for loc in data if isinstance(data, list) else [data]:
+        h = loc["hourly"]
+        # ponytail: a null hour (past the model horizon) reads as calm; departures are capped at 7 days out
+        series.append([
+            (h["wind_speed_10m"][i] or 0, (h["rain"][i] or 0) + (h["showers"][i] or 0), h["snowfall"][i] or 0)
+            for i in range(len(h["time"]))
+        ])
+    return series
+
+
+def met_no_hourly(timeseries, start, hours):
+    """MET Norway timeseries -> hourly (wind mph, rain in/hr, snow in/hr) from `start`, like Open-Meteo's.
+
+    Steps are hourly for ~2.5 days, then 6-hourly. Each hour takes the latest step at or before it, with
+    that step's next-hour precipitation, else its next-6-hour total spread evenly.
+    """
+    steps = [(datetime.fromisoformat(e["time"]), e["data"]) for e in timeseries]
+    out, i, wind, rain, snow = [], 0, 0.0, 0.0, 0.0
+    for h in range(hours + 1):
+        t = start + timedelta(hours=h)
+        while i < len(steps) and (steps[i][0] <= t or i == 0):
+            data = steps[i][1]
+            wind = data["instant"]["details"]["wind_speed"] * MPH_PER_MS
+            period = data.get("next_1_hours") or data.get("next_6_hours")
+            if period:
+                mm = period["details"]["precipitation_amount"] / (1 if "next_1_hours" in data else 6)
+                # Amounts are liquid-equivalent mm; the period's symbol ("lightsnow", "rain", ...) says which fell.
+                if "snow" in period["summary"]["symbol_code"]:
+                    rain, snow = 0.0, mm * SNOW_CM_PER_MM / 2.54
+                else:
+                    rain, snow = mm / 25.4, 0.0
+            i += 1
+        out.append((wind, rain, snow))
+    return out
+
+
+def _met_no(points, start, hours):
+    """One request per point; healthy calls take ~0.8 s, so a slow or failing one hands the batch to the backup."""
+
+    def one(point):
+        with _met_no_slots:
+            data = _fetch(f"{MET_NO}?lat={point[0]:.2f}&lon={point[1]:.2f}", attempts=2, timeout=10)
+        return met_no_hourly(data["properties"]["timeseries"], start, hours)
+
+    pool = ThreadPoolExecutor(10)
+    try:
+        return list(pool.map(one, points))
+    finally:
+        pool.shutdown(cancel_futures=True)  # after a failure, don't wait on the rest of the batch
+
+
 def _forecast(points, start, hours):
-    """Hourly (wind mph, rain in/hr, snow in/hr) for each point from `start`, cached per rounded point."""
+    """(source, hourly series) for each point from `start`, cached per rounded point.
+
+    MET Norway is the primary source while it has hourly data for the whole window, because it stays fast
+    when Open-Meteo is overloaded. Further out it only has 6-hour blocks, which would flatten short
+    bursts of heavy rain, so Open-Meteo (hourly for 16 days) goes first. Each source backs up the other,
+    per 50-point batch.
+    """
     keys = [f"wx:{lat:.2f},{lon:.2f}:{start:%Y%m%d%H}:{hours}" for lat, lon in points]
     found = cache.get_many(keys)
     missing = list({k: p for k, p in zip(keys, points) if k not in found}.items())
+    sources = [("MET Norway", _met_no), ("Open-Meteo", _open_meteo)]
+    if start + timedelta(hours=hours) > datetime.now(timezone.utc) + MET_NO_HOURLY:
+        sources.reverse()
 
     def fetch(chunk):
-        params = {
-            "latitude": ",".join(f"{p[0]:.2f}" for _, p in chunk),
-            "longitude": ",".join(f"{p[1]:.2f}" for _, p in chunk),
-            "hourly": "wind_speed_10m,rain,showers,snowfall",
-            "wind_speed_unit": "mph",
-            "precipitation_unit": "inch",  # also makes snowfall inches
-            "timezone": "GMT",
-            "start_hour": f"{start:%Y-%m-%dT%H:%M}",
-            "end_hour": f"{start + timedelta(hours=hours):%Y-%m-%dT%H:%M}",
-        }
-        data = _fetch(OPEN_METEO + "?" + urllib.parse.urlencode(params))
-        out = {}
-        for (key, _), loc in zip(chunk, data if isinstance(data, list) else [data]):
-            h = loc["hourly"]
-            # ponytail: a null hour (past the model horizon) reads as calm; departures are capped at 7 days out
-            out[key] = [
-                (h["wind_speed_10m"][i] or 0, (h["rain"][i] or 0) + (h["showers"][i] or 0), h["snowfall"][i] or 0)
-                for i in range(len(h["time"]))
-            ]
-        cache.set_many(out, 1800)  # cached per batch, so if another batch fails a retry only refetches that one
-        return out
+        pts, errors = [p for _, p in chunk], []
+        for name, source in sources:
+            try:
+                got = {k: (name, series) for (k, _), series in zip(chunk, source(pts, start, hours))}
+                break
+            except UpstreamError as e:
+                errors.append(str(e))
+        else:
+            raise UpstreamError("; ".join(errors))
+        cache.set_many(got, 1800)  # cached per batch, so if another batch fails a retry only refetches that one
+        return got
 
     with ThreadPoolExecutor(8) as pool:
         for got in pool.map(fetch, [missing[i : i + 50] for i in range(0, len(missing), 50)]):
@@ -260,7 +337,8 @@ def plan_trip(origin, dest, departure, load_lbs, interval_miles):
     for r in routes:
         r["cps"] = [(m, *_at(r, m)) for m in _marks(r["miles"][-1], interval_miles)]
     grid, step = _corridor_grid(routes)
-    weather = iter(_forecast([pt for r in routes for _, pt, _ in r["cps"]] + grid, start, hours))
+    forecasts = _forecast([pt for r in routes for _, pt, _ in r["cps"]] + grid, start, hours)
+    weather = (series for _, series in forecasts)
 
     out = []
     for r in routes:
@@ -303,4 +381,5 @@ def plan_trip(origin, dest, departure, load_lbs, interval_miles):
         "recommended": best,
         "reason": reason,
         "heatmap": {"start": start.isoformat(), "step_deg": round(step, 3), "points": heat},
+        "weather_sources": sorted({source for source, _ in forecasts}),
     }

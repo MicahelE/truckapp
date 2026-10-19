@@ -31,6 +31,7 @@ export type Trip = {
   reason: string;
   // points: [lon, lat, score at hour 0, ..., score at hour 48], score 0..4
   heatmap: { start: string; step_deg: number; points: number[][] };
+  weather_sources: string[];
 };
 
 export const LEVELS = ["Low", "Moderate", "High", "Severe", "No Travel"];

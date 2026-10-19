@@ -165,6 +165,8 @@ export default function App() {
               {trip.origin.label} → {trip.destination.label}
               <br />
               Departs {fmtTime(trip.departure)} · {trip.load_lbs.toLocaleString()} lb load
+              <br />
+              Weather: {trip.weather_sources.join(" + ")}
             </p>
             {trip.routes.length < 3 && (
               <p className="muted">Only {trip.routes.length} distinct route(s) exist between these points.</p>

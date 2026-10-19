@@ -2,10 +2,13 @@ import io
 import urllib.error
 from unittest import mock
 
+from datetime import datetime, timedelta, timezone
+
+from django.core.cache import cache
 from django.test import SimpleTestCase
 
 from .risk import HIGH, LOW, MODERATE, NO_TRAVEL, SEVERE, classify, recommend, score, summarize
-from .services import UpstreamError, _fetch, decode_polyline6
+from .services import UpstreamError, _fetch, _forecast, decode_polyline6, met_no_hourly
 
 
 class RiskRules(SimpleTestCase):
@@ -82,6 +85,13 @@ class Fetch(SimpleTestCase):
                     _fetch("https://x.test/")
             self.assertEqual(urlopen.call_count, 1)
 
+    def test_trickling_response_hits_the_deadline(self):
+        trickle = mock.MagicMock()
+        trickle.__enter__.return_value.read.side_effect = [b'{"a"', b": 1}", b""]
+        with mock.patch("urllib.request.urlopen", return_value=trickle), mock.patch("time.monotonic", side_effect=[0, 30, 61]):
+            with self.assertRaisesRegex(UpstreamError, "^x.test: response too slow$"):
+                _fetch("https://x.test/")
+
     def test_gives_up_after_repeated_server_errors(self):
         unavailable = urllib.error.HTTPError("u", 503, "Unavailable", {}, io.BytesIO(b""))
         with mock.patch("urllib.request.urlopen", side_effect=unavailable) as urlopen:
@@ -95,3 +105,52 @@ class Fetch(SimpleTestCase):
             with self.assertRaisesRegex(UpstreamError, "^x.test: Slow down$"):
                 _fetch("https://x.test/")
         self.assertEqual(urlopen.call_count, 1)
+
+
+class BackupWeather(SimpleTestCase):
+    START = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    def step(self, hour, wind_ms, period=None, mm=0, symbol="rain"):
+        data = {"instant": {"details": {"wind_speed": wind_ms}}}
+        if period:
+            data[period] = {"summary": {"symbol_code": symbol}, "details": {"precipitation_amount": mm}}
+        return {"time": f"2026-01-01T{hour:02d}:00:00Z", "data": data}
+
+    def test_met_no_converts_units_and_spreads_six_hour_blocks(self):
+        series = met_no_hourly([
+            self.step(0, 10, "next_1_hours", 2.54),
+            self.step(1, 0, "next_1_hours", 2.54, "lightsnow"),
+            self.step(2, 5, "next_6_hours", 15.24, "heavyrain"),
+            self.step(8, 1, "next_6_hours", 0, "cloudy"),
+        ], self.START, 8)
+        rounded = [tuple(round(v, 2) for v in hour) for hour in series]
+        self.assertEqual(rounded[0], (22.37, 0.1, 0))  # 10 m/s, 2.54 mm rain in the next hour
+        self.assertEqual(rounded[1], (0, 0, 0.7))  # snow: 2.54 mm liquid -> 1.78 cm -> 0.7 in
+        self.assertEqual(rounded[2:8], [(11.18, 0.1, 0)] * 6)  # 15.24 mm over 6 h = 0.1 in/hr each hour
+        self.assertEqual(rounded[8], (2.24, 0, 0))
+
+    def run_forecast(self, start, met_no, open_meteo, n=2):
+        cache.clear()
+        with mock.patch("routing.services._met_no", **met_no) as m, mock.patch("routing.services._open_meteo", **open_meteo) as o:
+            return _forecast([(40 + i, -95) for i in range(n)], start, 0), m, o
+
+    def test_near_term_uses_met_no_then_open_meteo(self):
+        soon = datetime.now(timezone.utc)
+        got, met, om = self.run_forecast(soon, {"return_value": [[(1, 0, 0)]] * 2}, {"return_value": [[(2, 0, 0)]] * 2})
+        self.assertEqual(got, [("MET Norway", [(1, 0, 0)])] * 2)
+        self.assertEqual(om.call_count, 0)
+
+        down = {"side_effect": UpstreamError("api.met.no: HTTP Error 503: Unavailable")}
+        got, met, om = self.run_forecast(soon, down, {"return_value": [[(2, 0, 0)]] * 2})
+        self.assertEqual(got, [("Open-Meteo", [(2, 0, 0)])] * 2)
+
+    def test_beyond_met_no_hourly_range_open_meteo_goes_first(self):
+        later = datetime.now(timezone.utc) + timedelta(days=4)
+        got, met, om = self.run_forecast(later, {"return_value": [[(1, 0, 0)]] * 2}, {"return_value": [[(2, 0, 0)]] * 2})
+        self.assertEqual(got, [("Open-Meteo", [(2, 0, 0)])] * 2)
+        self.assertEqual(met.call_count, 0)
+
+    def test_both_sources_down_reports_both(self):
+        got = lambda msg: {"side_effect": UpstreamError(msg)}
+        with self.assertRaisesRegex(UpstreamError, "^api.met.no: timed out; api.open-meteo.com: HTTP Error 503$"):
+            self.run_forecast(datetime.now(timezone.utc), got("api.met.no: timed out"), got("api.open-meteo.com: HTTP Error 503"))
