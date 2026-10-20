@@ -4,7 +4,7 @@ React + Django app that compares three truck routes between two places, forecast
 checkpoint will see **when the truck gets there**, classifies risk with the load-aware rules from the
 brief, and recommends the safest route.
 
-**Live:** https://truckapp-jtzg.onrender.com (free tier: the first visit after 15 idle minutes takes ~1 min to wake) · **Walkthrough:** _add Loom URL_
+**Live:** https://truckapp-jtzg.onrender.com (free tier: the first visit after 15 idle minutes takes ~1 min to wake) · **Walkthrough:** https://www.loom.com/share/86b0667e456d488aba06d3ea5669a91b
 
 ## Run locally
 
