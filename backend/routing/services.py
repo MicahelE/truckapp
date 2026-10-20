@@ -3,6 +3,7 @@
 import bisect
 import itertools
 import json
+import logging
 import math
 import threading
 import time
@@ -15,6 +16,8 @@ from datetime import datetime, timedelta, timezone
 from django.core.cache import cache
 
 from . import risk
+
+log = logging.getLogger(__name__)
 
 PHOTON = "https://photon.komoot.io/api/"
 VALHALLA = "https://valhalla1.openstreetmap.de/route"
@@ -311,6 +314,7 @@ def _forecast(points, start, hours):
                 got = {k: (name, series) for (k, _), series in zip(chunk, source(pts, start, hours))}
                 break
             except UpstreamError as e:
+                log.warning("%s failed for %d points: %s", name, len(pts), e)
                 errors.append(str(e))
         else:
             raise UpstreamError("; ".join(errors))
