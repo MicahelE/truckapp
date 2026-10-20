@@ -1,0 +1,10 @@
+# Render Blueprint: one free Docker web service (see README "Deploy").
+services:
+  - type: web
+    name: truckapp
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/geocode
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
